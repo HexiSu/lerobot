@@ -174,6 +174,40 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
     assert torch.allclose(queue_non_overlap_actions[0].get_action(), incoming[-1].get_action())
 
 
+def test_task_transition_clears_queue_and_sets_must_go(robot_client):
+    from lerobot.common.hierarchical_task import HierarchicalTaskManager, Subtask, TaskPlan
+
+    robot_client.task_manager = HierarchicalTaskManager(
+        TaskPlan("demo", [Subtask("Grab Orange"), Subtask("make a face")])
+    )
+    for action in _make_actions(start_ts=time.time(), start_t=1, count=3):
+        robot_client.action_queue.put(action)
+    robot_client.must_go.clear()
+
+    robot_client.task_manager.mark_success()
+    robot_client._handle_task_transition()
+
+    assert robot_client.action_queue.empty()
+    assert robot_client.must_go.is_set()
+    assert robot_client.task_manager.current_task() == "make a face"
+
+
+def test_control_loop_observation_injects_current_task(robot_client, monkeypatch):
+    sent_observations = []
+
+    def fake_send_observation(observation):
+        sent_observations.append(observation)
+        return True
+
+    monkeypatch.setattr(robot_client, "send_observation", fake_send_observation)
+    robot_client.action_chunk_size = 20
+
+    raw_observation = robot_client.control_loop_observation("make a face")
+
+    assert raw_observation["task"] == "make a face"
+    assert sent_observations[0].get_observation()["task"] == "make a face"
+
+
 @pytest.mark.parametrize(
     "chunk_size, queue_len, expected",
     [

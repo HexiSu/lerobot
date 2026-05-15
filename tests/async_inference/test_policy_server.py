@@ -93,20 +93,24 @@ def policy_server():
 # -----------------------------------------------------------------------------
 
 
-def _make_obs(state: torch.Tensor, timestep: int = 0, must_go: bool = False):
+def _make_obs(state: torch.Tensor, timestep: int = 0, must_go: bool = False, task: str | None = None):
     """Create a TimedObservation with a given state vector."""
     # Import only when needed
     from lerobot.async_inference.helpers import TimedObservation
 
+    observation = {
+        "joint1": state[0].item() if len(state) > 0 else 0.0,
+        "joint2": state[1].item() if len(state) > 1 else 0.0,
+        "joint3": state[2].item() if len(state) > 2 else 0.0,
+        "joint4": state[3].item() if len(state) > 3 else 0.0,
+        "joint5": state[4].item() if len(state) > 4 else 0.0,
+        "joint6": state[5].item() if len(state) > 5 else 0.0,
+    }
+    if task is not None:
+        observation["task"] = task
+
     return TimedObservation(
-        observation={
-            "joint1": state[0].item() if len(state) > 0 else 0.0,
-            "joint2": state[1].item() if len(state) > 1 else 0.0,
-            "joint3": state[2].item() if len(state) > 2 else 0.0,
-            "joint4": state[3].item() if len(state) > 3 else 0.0,
-            "joint5": state[4].item() if len(state) > 4 else 0.0,
-            "joint6": state[5].item() if len(state) > 5 else 0.0,
-        },
+        observation=observation,
         timestamp=time.time(),
         timestep=timestep,
         must_go=must_go,
@@ -189,6 +193,14 @@ def test_obs_sanity_checks(policy_server):
     assert policy_server._obs_sanity_checks(obs_ok, prev) is True
 
 
+def test_obs_sanity_checks_allows_task_change(policy_server):
+    prev = _make_obs(torch.zeros(6), timestep=0, task="Grab Orange")
+    obs_task_changed = _make_obs(torch.zeros(6) + 1e-4, timestep=1, task="make a face")
+    policy_server._predicted_timesteps.add(1)
+
+    assert policy_server._obs_sanity_checks(obs_task_changed, prev) is True
+
+
 def test_predict_action_chunk(monkeypatch, policy_server):
     """End-to-end test of `_predict_action_chunk` with a stubbed _get_action_chunk."""
     # Import only when needed
@@ -196,7 +208,8 @@ def test_predict_action_chunk(monkeypatch, policy_server):
 
     # Force server to act-style policy; patch method to return deterministic tensor
     policy_server.policy_type = "act"
-    # NOTE(Steven): Smelly tests as the Server is a state machine being partially mocked. Adding these processors as a quick fix.
+    # NOTE(Steven): Smelly tests as the Server is a state machine being partially mocked.
+    # Adding these processors as a quick fix.
     policy_server.preprocessor = lambda obs: obs
     policy_server.postprocessor = lambda tensor: tensor
     action_dim = 6

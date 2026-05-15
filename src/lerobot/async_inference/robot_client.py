@@ -66,6 +66,8 @@ from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
 
 from .configs import RobotClientConfig
+from lerobot.common.hierarchical_task import load_pi0_language_info, make_success_detector, make_task_manager
+
 from .helpers import (
     Action,
     FPSTracker,
@@ -129,6 +131,37 @@ class RobotClient:
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
+
+        success_detector = make_success_detector(
+            config.success_detector,
+            camera=config.success_camera,
+            cup_roi=config.cup_roi,
+            orange_hsv_lower=config.orange_hsv_lower,
+            orange_hsv_upper=config.orange_hsv_upper,
+            min_area=config.success_min_area,
+            hold_s=config.success_hold_s,
+            debug_view=config.success_debug_view,
+        )
+        self.task_manager = make_task_manager(
+            config.task,
+            task_planner=config.task_planner,
+            task_plan_json=config.task_plan_json,
+            default_timeout_s=config.subtask_timeout_s,
+            detector=success_detector,
+        )
+        if self.task_manager is not None:
+            self.logger.info(
+                "Task plan: "
+                f"{len(self.task_manager.plan.subtasks)} subtasks from "
+                f"{self.task_manager.plan.original_task!r}"
+            )
+            for i, subtask in enumerate(self.task_manager.plan.subtasks, start=1):
+                self.logger.info(
+                    f"Subtask {i}/{len(self.task_manager.plan.subtasks)}: {subtask.instruction!r}"
+                )
+            language_info = load_pi0_language_info(config.pretrained_name_or_path)
+            if language_info is not None:
+                self.logger.info(f"pi0 language info: {language_info}")
 
         self.logger.info("Robot connected and ready")
 
@@ -405,6 +438,37 @@ class RobotClient:
         with self.action_queue_lock:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
+    def _handle_task_transition(self) -> None:
+        if self.task_manager is None:
+            return
+
+        transition = self.task_manager.consume_transition()
+        if transition is None:
+            return
+
+        if self.config.clear_action_queue_on_subtask_change:
+            with self.action_queue_lock:
+                cleared_actions = self.action_queue.qsize()
+                self.action_queue = Queue()
+        else:
+            cleared_actions = 0
+
+        self.must_go.set()
+        if transition.done:
+            self.logger.info(
+                f"Subtask {transition.previous_index + 1}/{len(self.task_manager.plan.subtasks)} completed "
+                f"by {transition.reason}; task plan done. Cleared {cleared_actions} queued actions."
+            )
+            if self.config.stop_when_task_plan_done:
+                self.shutdown_event.set()
+            return
+
+        self.logger.info(
+            f"Subtask {transition.previous_index + 1}/{len(self.task_manager.plan.subtasks)} completed "
+            f"by {transition.reason}; switching from {transition.previous_task!r} to "
+            f"{transition.current_task!r}. Cleared {cleared_actions} queued actions."
+        )
+
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
@@ -447,7 +511,8 @@ class RobotClient:
                 )
 
                 self.logger.debug(
-                    f"Ts={observation.get_timestamp():.6f} | Capturing observation took {obs_capture_time:.6f}s"
+                    f"Ts={observation.get_timestamp():.6f} | "
+                    f"Capturing observation took {obs_capture_time:.6f}s"
                 )
 
             return raw_observation
@@ -472,7 +537,11 @@ class RobotClient:
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                current_task = self.task_manager.current_task() if self.task_manager is not None else task
+                _captured_observation = self.control_loop_observation(current_task, verbose)
+                if self.task_manager is not None:
+                    self.task_manager.update(_captured_observation)
+                    self._handle_task_transition()
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency

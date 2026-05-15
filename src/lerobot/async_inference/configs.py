@@ -19,6 +19,13 @@ import torch
 
 from lerobot.robots.config import RobotConfig
 
+from lerobot.common.hierarchical_task import (
+    SUPPORTED_SUCCESS_DETECTORS,
+    SUPPORTED_TASK_PLANNERS,
+    parse_hsv,
+    parse_roi,
+)
+
 from .constants import (
     DEFAULT_FPS,
     DEFAULT_INFERENCE_LATENCY,
@@ -121,6 +128,50 @@ class RobotClientConfig:
     # Task instruction for the robot to execute (e.g., 'fold my tshirt')
     task: str = field(default="", metadata={"help": "Task instruction for the robot to execute"})
 
+    # Hierarchical task planning and success detection
+    task_planner: str = field(
+        default="none",
+        metadata={"help": "Task planner to use. Options: none, rule_based, json, llm"},
+    )
+    task_plan_json: str | None = field(
+        default=None, metadata={"help": "JSON task plan used when task_planner=json"}
+    )
+    subtask_timeout_s: float | None = field(
+        default=None, metadata={"help": "Default timeout in seconds for each planned subtask"}
+    )
+    stop_when_task_plan_done: bool = field(
+        default=False, metadata={"help": "Stop the client after the final subtask succeeds"}
+    )
+    clear_action_queue_on_subtask_change: bool = field(
+        default=True, metadata={"help": "Discard queued actions when switching subtasks"}
+    )
+    success_detector: str = field(
+        default="none",
+        metadata={"help": "Subtask success detector. Options: none, timeout, orange_in_cup"},
+    )
+    success_camera: str = field(
+        default="front", metadata={"help": "Camera key used by visual success detectors"}
+    )
+    cup_roi: str | None = field(
+        default=None,
+        metadata={"help": "Cup ROI as x1,y1,x2,y2 for success_detector=orange_in_cup"},
+    )
+    orange_hsv_lower: str = field(
+        default="5,80,80", metadata={"help": "Lower HSV threshold for orange segmentation"}
+    )
+    orange_hsv_upper: str = field(
+        default="25,255,255", metadata={"help": "Upper HSV threshold for orange segmentation"}
+    )
+    success_min_area: int = field(
+        default=200, metadata={"help": "Minimum orange pixels inside cup ROI for success"}
+    )
+    success_hold_s: float = field(
+        default=0.5, metadata={"help": "Seconds the success condition must hold before advancing"}
+    )
+    success_debug_view: bool = field(
+        default=False, metadata={"help": "Show debug visualization for visual success detectors"}
+    )
+
     # Network configuration
     server_address: str = field(default="localhost:8080", metadata={"help": "Server address to connect to"})
 
@@ -179,6 +230,32 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.task_planner not in SUPPORTED_TASK_PLANNERS:
+            available = sorted(SUPPORTED_TASK_PLANNERS)
+            raise ValueError(f"task_planner must be one of {available}, got {self.task_planner}")
+
+        if self.success_detector not in SUPPORTED_SUCCESS_DETECTORS:
+            available = sorted(SUPPORTED_SUCCESS_DETECTORS)
+            raise ValueError(f"success_detector must be one of {available}, got {self.success_detector}")
+
+        if self.subtask_timeout_s is not None and self.subtask_timeout_s <= 0:
+            raise ValueError(f"subtask_timeout_s must be positive, got {self.subtask_timeout_s}")
+
+        if self.success_detector == "orange_in_cup" and self.cup_roi is None:
+            raise ValueError("cup_roi is required when success_detector='orange_in_cup'")
+
+        if self.cup_roi is not None:
+            parse_roi(self.cup_roi)
+
+        parse_hsv(self.orange_hsv_lower, "orange_hsv_lower")
+        parse_hsv(self.orange_hsv_upper, "orange_hsv_upper")
+
+        if self.success_min_area <= 0:
+            raise ValueError(f"success_min_area must be positive, got {self.success_min_area}")
+
+        if self.success_hold_s < 0:
+            raise ValueError(f"success_hold_s must be non-negative, got {self.success_hold_s}")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -198,6 +275,19 @@ class RobotClientConfig:
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
+            "task_planner": self.task_planner,
+            "task_plan_json": self.task_plan_json,
+            "subtask_timeout_s": self.subtask_timeout_s,
+            "stop_when_task_plan_done": self.stop_when_task_plan_done,
+            "clear_action_queue_on_subtask_change": self.clear_action_queue_on_subtask_change,
+            "success_detector": self.success_detector,
+            "success_camera": self.success_camera,
+            "cup_roi": self.cup_roi,
+            "orange_hsv_lower": self.orange_hsv_lower,
+            "orange_hsv_upper": self.orange_hsv_upper,
+            "success_min_area": self.success_min_area,
+            "success_hold_s": self.success_hold_s,
+            "success_debug_view": self.success_debug_view,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
         }

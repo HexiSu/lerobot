@@ -270,6 +270,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with self._predicted_timesteps_lock:
             predicted_timesteps = self._predicted_timesteps
 
+        current_task = obs.get_observation().get("task")
+        previous_task = previous_obs.get_observation().get("task")
+        if current_task != previous_task:
+            self.logger.debug(
+                f"Processing observation #{obs.get_timestep()} - "
+                f"Task changed from {previous_task!r} to {current_task!r}"
+            )
+            return True
+
         if obs.get_timestep() in predicted_timesteps:
             self.logger.debug(f"Skipping observation #{obs.get_timestep()} - Timestep predicted already!")
             return False

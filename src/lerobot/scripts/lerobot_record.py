@@ -90,6 +90,15 @@ from lerobot.common.control_utils import (
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
+from lerobot.common.hierarchical_task import (
+    SUPPORTED_SUCCESS_DETECTORS,
+    SUPPORTED_TASK_PLANNERS,
+    HierarchicalTaskManager,
+    make_success_detector,
+    make_task_manager,
+    parse_hsv,
+    parse_roi,
+)
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.datasets import (
     LeRobotDataset,
@@ -208,10 +217,49 @@ class DatasetRecordConfig:
     encoder_threads: int | None = None
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Hierarchical local policy task planning and success detection.
+    task_planner: str = "none"
+    task_plan_json: str | None = None
+    subtask_timeout_s: float | None = None
+    stop_when_task_plan_done: bool = False
+    success_detector: str = "none"
+    success_camera: str = "front"
+    cup_roi: str | None = None
+    orange_hsv_lower: str = "5,80,80"
+    orange_hsv_upper: str = "25,255,255"
+    success_min_area: int = 200
+    success_hold_s: float = 0.5
+    success_debug_view: bool = False
 
     def __post_init__(self):
         if self.single_task is None:
             raise ValueError("You need to provide a task as argument in `single_task`.")
+
+        if self.task_planner not in SUPPORTED_TASK_PLANNERS:
+            available = sorted(SUPPORTED_TASK_PLANNERS)
+            raise ValueError(f"task_planner must be one of {available}, got {self.task_planner}")
+
+        if self.success_detector not in SUPPORTED_SUCCESS_DETECTORS:
+            available = sorted(SUPPORTED_SUCCESS_DETECTORS)
+            raise ValueError(f"success_detector must be one of {available}, got {self.success_detector}")
+
+        if self.subtask_timeout_s is not None and self.subtask_timeout_s <= 0:
+            raise ValueError(f"subtask_timeout_s must be positive, got {self.subtask_timeout_s}")
+
+        if self.success_detector == "orange_in_cup" and self.cup_roi is None:
+            raise ValueError("cup_roi is required when success_detector='orange_in_cup'")
+
+        if self.cup_roi is not None:
+            parse_roi(self.cup_roi)
+
+        parse_hsv(self.orange_hsv_lower, "orange_hsv_lower")
+        parse_hsv(self.orange_hsv_upper, "orange_hsv_upper")
+
+        if self.success_min_area <= 0:
+            raise ValueError(f"success_min_area must be positive, got {self.success_min_area}")
+
+        if self.success_hold_s < 0:
+            raise ValueError(f"success_hold_s must be non-negative, got {self.success_hold_s}")
 
 
 @dataclass
@@ -311,6 +359,8 @@ def record_loop(
     display_data: bool = False,
     interpolator: ActionInterpolator | None = None,
     display_compressed_images: bool = False,
+    task_manager: HierarchicalTaskManager | None = None,
+    stop_when_task_plan_done: bool = False,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -372,6 +422,32 @@ def record_loop(
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 
+        if task_manager is not None:
+            task_manager.update(obs_processed)
+            transition = task_manager.consume_transition()
+            if transition is not None:
+                logging.info(
+                    "Subtask %s/%s completed by %s; switching from %r to %r",
+                    transition.previous_index + 1,
+                    len(task_manager.plan.subtasks),
+                    transition.reason,
+                    transition.previous_task,
+                    transition.current_task,
+                )
+                if policy is not None:
+                    policy.reset()
+                if preprocessor is not None:
+                    preprocessor.reset()
+                if postprocessor is not None:
+                    postprocessor.reset()
+                if interpolator is not None:
+                    interpolator.reset()
+                if transition.done and stop_when_task_plan_done:
+                    events["stop_recording"] = True
+                    break
+
+        current_task = task_manager.current_task() if task_manager is not None else single_task
+
         if policy is not None or dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
@@ -394,7 +470,7 @@ def record_loop(
                         preprocessor=preprocessor,
                         postprocessor=postprocessor,
                         use_amp=policy.config.use_amp,
-                        task=single_task,
+                        task=current_task,
                         robot_type=robot.robot_type,
                     )
                     act_processed_policy = make_robot_action(action_values, dataset.features)
@@ -420,7 +496,7 @@ def record_loop(
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                     use_amp=policy.config.use_amp,
-                    task=single_task,
+                    task=current_task,
                     robot_type=robot.robot_type,
                 )
                 act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
@@ -466,7 +542,7 @@ def record_loop(
         # Write to dataset (only on real policy frames, not interpolated-only iterations)
         if dataset is not None and is_record_frame:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            frame = {**observation_frame, **action_frame, "task": single_task}
+            frame = {**observation_frame, **action_frame, "task": current_task}
             dataset.add_frame(frame)
 
         if display_data:
@@ -588,6 +664,42 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         listener, events = init_keyboard_listener()
 
+        def make_record_task_manager() -> HierarchicalTaskManager | None:
+            if cfg.policy is None or cfg.dataset.task_planner == "none":
+                return None
+
+            success_detector = make_success_detector(
+                cfg.dataset.success_detector,
+                camera=cfg.dataset.success_camera,
+                cup_roi=cfg.dataset.cup_roi,
+                orange_hsv_lower=cfg.dataset.orange_hsv_lower,
+                orange_hsv_upper=cfg.dataset.orange_hsv_upper,
+                min_area=cfg.dataset.success_min_area,
+                hold_s=cfg.dataset.success_hold_s,
+                debug_view=cfg.dataset.success_debug_view,
+            )
+            manager = make_task_manager(
+                cfg.dataset.single_task,
+                task_planner=cfg.dataset.task_planner,
+                task_plan_json=cfg.dataset.task_plan_json,
+                default_timeout_s=cfg.dataset.subtask_timeout_s,
+                detector=success_detector,
+            )
+            if manager is not None:
+                logging.info(
+                    "Local task plan: %s subtasks from %r",
+                    len(manager.plan.subtasks),
+                    manager.plan.original_task,
+                )
+                for i, subtask in enumerate(manager.plan.subtasks, start=1):
+                    logging.info(
+                        "Local subtask %s/%s: %r",
+                        i,
+                        len(manager.plan.subtasks),
+                        subtask.instruction,
+                    )
+            return manager
+
         if not cfg.dataset.streaming_encoding:
             logging.info(
                 "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
@@ -596,6 +708,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                task_manager = make_record_task_manager()
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -614,6 +727,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     interpolator=interpolator,
                     display_compressed_images=display_compressed_images,
+                    task_manager=task_manager,
+                    stop_when_task_plan_done=cfg.dataset.stop_when_task_plan_done,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
