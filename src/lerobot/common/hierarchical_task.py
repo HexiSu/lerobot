@@ -343,15 +343,18 @@ def parse_hsv(value: str, name: str) -> tuple[int, int, int]:
 
 def load_pi0_language_info(pretrained_name_or_path: str) -> Pi0LanguageInfo | None:
     path = Path(pretrained_name_or_path)
-    if not path.exists():
-        return None
+    try:
+        if not path.exists():
+            return None
 
-    config_path = path / "config.json"
-    preprocessor_path = path / "policy_preprocessor.json"
-    if not config_path.exists():
-        return None
+        config_path = path / "config.json"
+        preprocessor_path = path / "policy_preprocessor.json"
+        if not config_path.exists():
+            return None
 
-    config = json.loads(config_path.read_text())
+        config = json.loads(config_path.read_text())
+    except OSError:
+        return None
     tokenizer_name = None
     tokenizer_max_length = config.get("tokenizer_max_length")
 
