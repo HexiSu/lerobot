@@ -49,6 +49,7 @@ import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.common.hierarchical_task import load_pi0_language_info, make_success_detector, make_task_manager
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -66,8 +67,6 @@ from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
 
 from .configs import RobotClientConfig
-from lerobot.common.hierarchical_task import load_pi0_language_info, make_success_detector, make_task_manager
-
 from .helpers import (
     Action,
     FPSTracker,

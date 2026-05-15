@@ -17,14 +17,13 @@ from dataclasses import dataclass, field
 
 import torch
 
-from lerobot.robots.config import RobotConfig
-
 from lerobot.common.hierarchical_task import (
     SUPPORTED_SUCCESS_DETECTORS,
     SUPPORTED_TASK_PLANNERS,
     parse_hsv,
     parse_roi,
 )
+from lerobot.robots.config import RobotConfig
 
 from .constants import (
     DEFAULT_FPS,
