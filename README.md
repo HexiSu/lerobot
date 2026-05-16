@@ -18,19 +18,19 @@ High-level task planning -> FSM task manager -> pi0/VLA low-level action policy
 
 ### Single-task pi0 inference: Grab Oranges
 
-The pi0 policy was fully fine-tuned on an A6000 and deployed through asynchronous inference on an RTX 4090. The video below is shown at 3x speed.
+The pi0 policy was fully fine-tuned on an A6000 and deployed through asynchronous inference on an RTX 4090. The preview below is generated from the 3x-speed video.
 
-https://raw.githubusercontent.com/HexiSu/lerobot/main/assets/grab-oranges-3x.mp4
+![Single-task Grab Oranges demo](assets/grab-oranges-preview.gif)
 
-Fallback link: [assets/grab-oranges-3x.mp4](assets/grab-oranges-3x.mp4)
+Full video: [assets/grab-oranges-3x.mp4](assets/grab-oranges-3x.mp4)
 
 ### Multi-task pi0 inference: Grab Orange, then Push Cup
 
 The robot first executes `Grab Orange`. After the success detector observes that the orange has entered the configured cup ROI, the FSM switches to the next subtask and clears stale action chunks before executing `Push Cup`.
 
-https://raw.githubusercontent.com/HexiSu/lerobot/main/assets/Muti-task.mp4
+![Multi-task Grab Orange then Push Cup demo](assets/multi-task-preview.gif)
 
-Fallback link: [assets/Muti-task.mp4](assets/Muti-task.mp4)
+Full video: [assets/Muti-task.mp4](assets/Muti-task.mp4)
 
 The original single-task video is also kept at [assets/Grab Oranges.mp4](assets/Grab%20Oranges.mp4).
 
