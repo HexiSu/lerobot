@@ -356,7 +356,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action, task=task)
+            TimedAction(
+                timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action, task=task
+            )
             for i, action in enumerate(action_chunk)
         ]
 
