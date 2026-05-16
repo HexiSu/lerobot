@@ -20,7 +20,7 @@ High-level task planning -> FSM task manager -> pi0/VLA low-level action policy
 
 The pi0 policy was fully fine-tuned on an A6000 and deployed through asynchronous inference on an RTX 4090. The video below is shown at 3x speed.
 
-<video src="assets/grab-oranges-3x.mp4" controls width="720"></video>
+https://raw.githubusercontent.com/HexiSu/lerobot/main/assets/grab-oranges-3x.mp4
 
 Fallback link: [assets/grab-oranges-3x.mp4](assets/grab-oranges-3x.mp4)
 
@@ -28,7 +28,7 @@ Fallback link: [assets/grab-oranges-3x.mp4](assets/grab-oranges-3x.mp4)
 
 The robot first executes `Grab Orange`. After the success detector observes that the orange has entered the configured cup ROI, the FSM switches to the next subtask and clears stale action chunks before executing `Push Cup`.
 
-<video src="assets/Muti-task.mp4" controls width="720"></video>
+https://raw.githubusercontent.com/HexiSu/lerobot/main/assets/Muti-task.mp4
 
 Fallback link: [assets/Muti-task.mp4](assets/Muti-task.mp4)
 
