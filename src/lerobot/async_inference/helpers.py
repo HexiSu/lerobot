@@ -220,9 +220,13 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
+    task: str | None = None
 
     def get_action(self):
         return self.action
+
+    def get_task(self):
+        return self.task
 
 
 @dataclass

@@ -1,177 +1,315 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
-</p>
+# LeRobot SO-ARM101 Pi0 Hierarchical Inference
 
-<div align="center">
+This repository is a project fork built on top of [Hugging Face LeRobot](https://github.com/huggingface/lerobot). It keeps the original LeRobot training, dataset, robot-control, and policy infrastructure, and adds a practical long-horizon execution layer for a SO-ARM101 robot arm using a fine-tuned pi0 policy.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml?query=branch%3Amain)
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/q8Dzzpym3f)
+The main goal is to move beyond single-command VLA inference such as `Grab Orange` and support staged tasks such as:
 
-</div>
+```text
+Grab Orange, when done, then Push Cup
+```
 
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
+The implementation follows a hierarchical control design:
 
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
+```text
+High-level task planning -> FSM task manager -> pi0/VLA low-level action policy
+```
 
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
+## Demo Videos
 
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
+### Single-task pi0 inference: Grab Oranges
 
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
+The pi0 policy was fully fine-tuned on an A6000 and deployed through asynchronous inference on an RTX 4090. The video below is shown at 3x speed.
 
-## Quick Start
+<video src="assets/grab-oranges-3x.mp4" controls width="720"></video>
 
-LeRobot can be installed directly from PyPI.
+Fallback link: [assets/grab-oranges-3x.mp4](assets/grab-oranges-3x.mp4)
+
+### Multi-task pi0 inference: Grab Orange, then Push Cup
+
+The robot first executes `Grab Orange`. After the success detector observes that the orange has entered the configured cup ROI, the FSM switches to the next subtask and clears stale action chunks before executing `Push Cup`.
+
+<video src="assets/Muti-task.mp4" controls width="720"></video>
+
+Fallback link: [assets/Muti-task.mp4](assets/Muti-task.mp4)
+
+The original single-task video is also kept at [assets/Grab Oranges.mp4](assets/Grab%20Oranges.mp4).
+
+## What This Project Adds
+
+Compared with upstream LeRobot, this project adds:
+
+- **Hierarchical task execution for pi0**: long natural-language tasks can be split into ordered subtasks with a finite-state machine.
+- **Rule-based and JSON task planners**: deterministic first-version planners for repeatable robotics experiments.
+- **LLM planner extension point**: `task_planner=llm` is reserved as an explicit integration point. The pi0 checkpoint's PaliGemma/Gemma components are used for VLA action conditioning, not as a general chat-style planner.
+- **Visual success detection**: an `orange_in_cup` detector based on HSV segmentation and a configurable cup ROI.
+- **Async cloud inference workflow**: the robot client can run locally while the pi0 policy server runs on a remote GPU machine through an SSH tunnel.
+- **Stale action protection during subtask switches**: action chunks are tagged with their source task, and the client drops delayed chunks from previous subtasks after an FSM transition.
+- **Policy-server reuse**: the async server can reuse an already loaded policy when the same checkpoint is requested again, avoiding unnecessary reloads during repeated experiments.
+- **Inference memory fix**: async policy inference runs under `torch.inference_mode()` to avoid retaining autograd graphs and exhausting GPU memory.
+
+## Project Architecture
+
+Key additions are concentrated in these areas:
+
+- [src/lerobot/common/hierarchical_task.py](src/lerobot/common/hierarchical_task.py): task plans, rule-based/json planners, FSM task manager, pi0 language-info loader, and success detectors.
+- [src/lerobot/async_inference/robot_client.py](src/lerobot/async_inference/robot_client.py): dynamic current-task selection, FSM transition handling, action-queue clearing, and stale action-chunk filtering.
+- [src/lerobot/async_inference/policy_server.py](src/lerobot/async_inference/policy_server.py): task-change filtering protection, no-grad inference, policy reuse, and action task tagging.
+- [src/lerobot/async_inference/configs.py](src/lerobot/async_inference/configs.py): CLI configuration for task planners and success detectors.
+- [src/lerobot/scripts/lerobot_record.py](src/lerobot/scripts/lerobot_record.py): local `lerobot-record` support for the same hierarchical task workflow.
+
+At runtime, the async flow is:
+
+1. The local robot client captures SO-ARM101 observations and camera frames.
+2. The task planner creates subtasks from the original task string.
+3. The FSM exposes the current subtask text to pi0 as the `task` field.
+4. The remote policy server predicts action chunks for the current subtask.
+5. The client executes actions locally.
+6. The success detector updates the FSM; on transition, the client clears queued actions and forces the next observation to be processed.
+
+## Hardware and Training Setup
+
+This project was tested with:
+
+- Robot: SO-ARM101 follower arm.
+- Cameras: one wrist/front camera and one fixed side camera.
+- Policy: pi0, fully fine-tuned from `lerobot/pi0_base`.
+- Training GPU: NVIDIA A6000.
+- Async inference GPU: NVIDIA RTX 4090.
+- Task examples: `Grab Orange`, `Grab Orange, when done, then Push Cup`.
+
+## Installation
+
+Start from a normal LeRobot development install. For pi0 and async inference, install the relevant extras:
 
 ```bash
-pip install lerobot
-lerobot-info
+conda create -n lerobot python=3.12 -y
+conda activate lerobot
+git clone https://github.com/HexiSu/lerobot.git
+cd lerobot
+pip install -e ".[pi,async]"
 ```
 
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+If you use `uv`, the upstream LeRobot workflow also works:
 
-## Robots & Control
-
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
-
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
-
-```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
+```bash
+uv sync --locked --extra pi --extra async --extra test --extra dev
 ```
 
-**Supported Hardware:** SO100, LeKiwi, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones, OpenARM, Unitree G1.
+## Data Collection
 
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
+Example SO-ARM101 data collection command:
 
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## LeRobot Dataset
-
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
-
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
-
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
-
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
+```bash
+lerobot-record \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=suhexi_follower_arm \
+    --robot.cameras='{ front: {type: opencv, index_or_path: 3, width: 640, height: 480, fps: 60, fourcc: "MJPG"}, side: {type: opencv, index_or_path: 6, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}' \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM3 \
+    --teleop.id=suhexi_leader_arm \
+    --display_data=true \
+    --dataset.repo_id=SuHexi/lerobot_suhexi_dataset_b \
+    --dataset.num_episodes=7 \
+    --dataset.single_task="Point At Snack" \
+    --dataset.push_to_hub=false
 ```
 
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
+Useful setup commands:
 
-## SoTA Models
+```bash
+lerobot-find-cameras opencv
+lerobot-find-port
+sudo chmod 666 /dev/ttyACM*
+hf auth login
+wandb login
+```
 
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, and Vision-Language-Action (VLA) models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
+## Pi0 Fine-tuning
 
-<p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
-</p>
-
-Training a policy is as simple as running a script configuration:
+Example pi0 training command:
 
 ```bash
 lerobot-train \
-  --policy=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet
+  --dataset.repo_id=SuHexi/lerobot_suhexi_dataset_b \
+  --dataset.root=../datasets/lerobot_suhexi_dataset_b \
+  --dataset.revision=v0.1.0 \
+  --dataset.streaming=false \
+  --policy.type=pi0 \
+  --output_dir=./outputs/train/pi0 \
+  --job_name=pi0 \
+  --policy.pretrained_path=lerobot/pi0_base \
+  --policy.compile_model=true \
+  --policy.gradient_checkpointing=true \
+  --policy.dtype=bfloat16 \
+  --policy.freeze_vision_encoder=false \
+  --policy.train_expert_only=false \
+  --steps=50000 \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --wandb.enable=true \
+  --wandb.project=Lerobot_suhexi \
+  --batch_size=8 \
+  --dataset.video_backend=pyav
 ```
 
-| Category                   | Models                                                                                                                                                                                                                  |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md) |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                             |
-| **VLAs Models**            | [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [GR00T N1.5](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx)            |
+For inference checkpoints, disable training-only options in the exported `config.json` if startup is slow or memory-constrained:
 
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub
+```json
+{
+  "compile_model": false,
+  "gradient_checkpointing": false
+}
+```
 
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies).
+## Async Inference
 
-## Inference & Evaluation
-
-Evaluate your policies in simulation or on real hardware using the unified evaluation script. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come.
+Run the policy server on the GPU machine:
 
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+python -m lerobot.async_inference.policy_server \
+    --host=127.0.0.1 \
+    --port=8080
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub)
+Forward the server port to the local robot machine if the GPU server is remote:
 
-## Resources
+```bash
+ssh -N -L 8080:127.0.0.1:8080 <user>@<remote-host>
+```
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/q8Dzzpym3f):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
+Run a single-task client locally:
 
-## Citation
+```bash
+python -m lerobot.async_inference.robot_client \
+    --server_address=127.0.0.1:8080 \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=suhexi_follower_arm \
+    --robot.cameras='{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 60, fourcc: "MJPG"}, side: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}' \
+    --task="Grab Orange" \
+    --policy_type=pi0 \
+    --pretrained_name_or_path=/root/autodl-tmp/outputs/train/pi0/checkpoints/last/pretrained_model \
+    --policy_device=cuda \
+    --actions_per_chunk=50 \
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name=weighted_average
+```
 
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
+Run a multi-stage client:
+
+```bash
+python -m lerobot.async_inference.robot_client \
+    --server_address=127.0.0.1:8080 \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=suhexi_follower_arm \
+    --robot.cameras='{ front: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 60, fourcc: "MJPG"}, side: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}' \
+    --task="Grab Orange, when done, then Push Cup" \
+    --task_planner=rule_based \
+    --success_detector=orange_in_cup \
+    --success_camera=side \
+    --cup_roi="15,220,180,365" \
+    --orange_hsv_lower="8,150,120" \
+    --orange_hsv_upper="18,255,255" \
+    --success_min_area=500 \
+    --success_hold_s=1.0 \
+    --policy_type=pi0 \
+    --pretrained_name_or_path=/root/autodl-tmp/outputs/train/pi0/checkpoints/last/pretrained_model \
+    --policy_device=cuda \
+    --actions_per_chunk=50 \
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name=weighted_average
+```
+
+Notes:
+
+- `task_planner=rule_based` splits connectors such as `when done, then`, `then`, and `然后`.
+- `orange_in_cup` is a task-specific detector, not a general success detector.
+- `cup_roi` must be calibrated for the side camera view.
+- For headless servers, keep `success_debug_view=false`; GUI OpenCV windows may not be available.
+- The model path is resolved on the policy-server machine, not on the local robot-client machine.
+
+## Local Hierarchical Inference
+
+The same task-planning options are also available through local `lerobot-record` inference:
+
+```bash
+lerobot-record \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.cameras='{ front: {type: opencv, index_or_path: 6, width: 640, height: 480, fps: 60, fourcc: "MJPG"}, side: {type: opencv, index_or_path: 7, width: 640, height: 480, fps: 30, fourcc: "MJPG"}}' \
+  --robot.id=suhexi_follower_arm \
+  --display_data=false \
+  --dataset.repo_id=SuHexi/eval_lerobot_suhexi_pi0_multistage \
+  --dataset.single_task="Grab Orange, when done, then Push Cup" \
+  --dataset.task_planner=rule_based \
+  --dataset.success_detector=orange_in_cup \
+  --dataset.success_camera=side \
+  --dataset.cup_roi="15,220,180,365" \
+  --policy.path=SuHexi/lerobot_suhexi_pi0 \
+  --dataset.push_to_hub=false
+```
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'lerobot'`
+
+Install the repository in the active environment:
+
+```bash
+pip install -e ".[pi,async]"
+```
+
+Or run with:
+
+```bash
+PYTHONPATH=src python -m lerobot.async_inference.robot_client ...
+```
+
+### `CUDA out of memory` on the policy server
+
+Stop stale server processes and restart with inference-only settings:
+
+```bash
+pkill -f lerobot.async_inference.policy_server
+nvidia-smi
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTORCH_ALLOC_CONF=expandable_segments:True \
+python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080
+```
+
+Make sure the server code uses `torch.inference_mode()` for async policy prediction.
+
+### Tokenizer download errors
+
+If the server cannot reach Hugging Face, point `policy_preprocessor.json` at a local tokenizer snapshot:
+
+```json
+"tokenizer_name": "/path/to/models--google--paligemma-3b-pt-224/snapshots/<revision>"
+```
+
+### Robot serial port errors
+
+```bash
+lerobot-find-port
+sudo chmod 666 /dev/ttyACM*
+lsof /dev/ttyACM0
+```
+
+Kill old local clients if they still hold the port.
+
+## Relationship to Upstream LeRobot
+
+This repository remains based on Hugging Face LeRobot and keeps the upstream Apache-2.0 license and citation requirements. The additions here are project-specific extensions for SO-ARM101 pi0 fine-tuning, cloud async inference, and multi-stage task execution.
+
+If you use the underlying LeRobot framework, please cite the upstream project:
 
 ```bibtex
 @misc{cadene2024lerobot,
     author = {Cadene, Remi and Alibert, Simon and Soare, Alexander and Gallouedec, Quentin and Zouitine, Adil and Palma, Steven and Kooijmans, Pepijn and Aractingi, Michel and Shukor, Mustafa and Aubakirova, Dana and Russi, Martino and Capuano, Francesco and Pascal, Caroline and Choghari, Jade and Moss, Jess and Wolf, Thomas},
     title = {LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch},
-    howpublished = "\url{https://github.com/huggingface/lerobot}",
+    howpublished = "\\url{https://github.com/huggingface/lerobot}",
     year = {2024}
 }
 ```
-
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
-
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
-
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
-```
-
-</details>
-
-## Contribute
-
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
-
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
-
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>

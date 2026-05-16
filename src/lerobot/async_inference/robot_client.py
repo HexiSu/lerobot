@@ -361,6 +361,15 @@ class RobotClient:
                         f"Deserialization time: {deserialize_time * 1000:.2f}ms"
                     )
 
+                if self.task_manager is not None and len(timed_actions) > 0:
+                    current_task = self.task_manager.current_task()
+                    action_task = timed_actions[0].get_task()
+                    if action_task is not None and action_task != current_task:
+                        self.logger.info(
+                            f"Dropping stale action chunk for task {action_task!r}; current task is {current_task!r}"
+                        )
+                        continue
+
                 # Update action queue
                 start_time = time.perf_counter()
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)

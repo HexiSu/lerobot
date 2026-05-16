@@ -80,6 +80,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.last_processed_obs = None
 
         # Attributes will be set by SendPolicyInstructions
+        self._loaded_policy_specs_key = None
         self.device = None
         self.policy_type = None
         self.lerobot_features = None
@@ -101,6 +102,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # only running inference on the latest observation received by the server
         self.shutdown_event.set()
         self.observation_queue = Queue(maxsize=1)
+        self.last_processed_obs = None
 
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
@@ -141,6 +143,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Device: {policy_specs.device}"
         )
 
+        policy_specs_key = (
+            policy_specs.policy_type,
+            policy_specs.pretrained_name_or_path,
+            policy_specs.device,
+            tuple(sorted(policy_specs.rename_map.items())),
+        )
+        if self.policy is not None and self._loaded_policy_specs_key == policy_specs_key:
+            self.logger.info("Reusing already loaded policy and processors")
+            self.device = policy_specs.device
+            self.policy_type = policy_specs.policy_type
+            self.lerobot_features = policy_specs.lerobot_features
+            self.actions_per_chunk = policy_specs.actions_per_chunk
+            return services_pb2.Empty()
+
         self.device = policy_specs.device
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
@@ -149,8 +165,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
+        self.logger.info("Loading policy weights")
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        self.logger.info("Policy weights loaded; moving policy to device")
         self.policy.to(self.device)
+        self.logger.info("Policy moved to device; loading pre/post processors")
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
@@ -163,6 +182,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             },
             postprocessor_overrides={"device_processor": device_override},
         )
+        self._loaded_policy_specs_key = policy_specs_key
+        self.logger.info("Pre/post processors loaded")
 
         end = time.perf_counter()
 
@@ -180,10 +201,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         received_bytes = receive_bytes_in_chunks(
             request_iterator, None, self.shutdown_event, self.logger
         )  # blocking call while looping over request_iterator
+        if received_bytes is None:
+            self.logger.info("Observation stream ended before receiving a complete observation")
+            return services_pb2.Empty()
+        self.logger.info(f"Received observation payload: {len(received_bytes) / 1024 / 1024:.2f} MB")
         timed_observation = pickle.loads(received_bytes)  # nosec
         deserialize_time = time.perf_counter() - start_deserialize
 
-        self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
+        self.logger.info(
+            f"Received observation #{timed_observation.get_timestep()} (must_go: {timed_observation.must_go})"
+        )
 
         obs_timestep = timed_observation.get_timestep()
         obs_timestamp = timed_observation.get_timestamp()
@@ -220,6 +247,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # Generate action based on the most recent observation and its timestep
         try:
             getactions_starts = time.perf_counter()
+            self.logger.info("GetActions called; waiting for an observation")
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
             self.logger.info(
                 f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
@@ -258,6 +286,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return actions
 
         except Empty:  # no observation added to queue in obs_queue_timeout
+            self.logger.info("GetActions timed out waiting for an observation")
             return services_pb2.Empty()
 
         except Exception as e:
@@ -314,17 +343,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
             # Now put the new observation (never blocks as queue is non-full here)
             self.observation_queue.put(obs)
+            self.logger.info(f"Observation #{obs.get_timestep()} enqueued for inference")
             return True
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _time_action_chunk(
+        self, t_0: float, action_chunk: list[torch.Tensor], i_0: int, task: str | None
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
+            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action, task=task)
             for i, action in enumerate(action_chunk)
         ]
 
@@ -393,7 +425,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            observation_t.get_observation().get("task"),
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
